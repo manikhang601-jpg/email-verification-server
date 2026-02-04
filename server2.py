@@ -1,73 +1,144 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
+import sqlite3
+import random
 import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-import uuid
-import os
+import time
 
+# ================= BASIC SETUP =================
 app = Flask(__name__)
+CORS(app)
 
-# Email config (Railway variables)
-MAIL_USERNAME = os.getenv("MAIL_USERNAME")
-MAIL_PASSWORD = os.getenv("MAIL_PASSWORD")
+DB_NAME = "users.db"
 
-# Temporary store (simple)
-pending_users = {}
+EMAIL_SENDER = "YOUR_GMAIL@gmail.com"
+EMAIL_PASSWORD = "YOUR_APP_PASSWORD"   # Gmail App Password
+OTP_EXPIRY_SECONDS = 20 * 60  # ✅ 20 minutes
 
-@app.route("/")
-def home():
-    return "Email Verification Server Running ✅"
+# ================= DATABASE =================
+def get_db():
+    return sqlite3.connect(DB_NAME)
 
-@app.route("/send_verification", methods=["POST"])
-def send_verification():
-    data = request.json
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            email TEXT PRIMARY KEY,
+            code TEXT,
+            verified INTEGER,
+            created_at INTEGER
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ================= EMAIL SENDER =================
+def send_email(to_email, code):
+    subject = "Email Verification Code"
+    body = f"Your verification code is: {code}\n\nThis code is valid for 20 minutes."
+    message = f"Subject: {subject}\n\n{body}"
+
+    server = smtplib.SMTP("smtp.gmail.com", 587)
+    server.starttls()
+    server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+    server.sendmail(EMAIL_SENDER, to_email, message)
+    server.quit()
+
+# ================= SEND CODE API =================
+@app.route("/send-code", methods=["POST"])
+def send_code():
+    data = request.get_json()
     email = data.get("email")
 
     if not email:
         return jsonify({"error": "Email required"}), 400
 
-    token = str(uuid.uuid4())
-    pending_users[token] = email
+    conn = get_db()
+    cur = conn.cursor()
 
-    verify_link = f"https://email-verification-server-production.up.railway.app/verify?token={token}"
+    # already verified?
+    cur.execute("SELECT verified FROM users WHERE email=?", (email,))
+    row = cur.fetchone()
+    if row and row[0] == 1:
+        conn.close()
+        return jsonify({"status": "already_verified"})
 
-    msg = MIMEMultipart()
-    msg["From"] = MAIL_USERNAME
-    msg["To"] = email
-    msg["Subject"] = "Verify your email"
+    code = str(random.randint(100000, 999999))
+    created_at = int(time.time())
 
-    body = f"""
-    Hello 👋
+    cur.execute("""
+        INSERT OR REPLACE INTO users (email, code, verified, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (email, code, 0, created_at))
 
-    Click the link below to verify your email:
+    conn.commit()
+    conn.close()
 
-    {verify_link}
+    send_email(email, code)
 
-    Thanks ❤️
-    """
-    msg.attach(MIMEText(body, "plain"))
+    return jsonify({"status": "code_sent"})
 
-    try:
-        server = smtplib.SMTP("smtp.gmail.com", 587)
-        server.starttls()
-        server.login(MAIL_USERNAME, MAIL_PASSWORD)
-        server.send_message(msg)
-        server.quit()
-        return jsonify({"message": "Verification email sent"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+# ================= VERIFY CODE API =================
+@app.route("/verify-code", methods=["POST"])
+def verify_code():
+    data = request.get_json()
+    email = data.get("email")
+    code = data.get("code")
 
+    if not email or not code:
+        return jsonify({"error": "Email and code required"}), 400
 
-@app.route("/verify")
-def verify():
-    token = request.args.get("token")
+    conn = get_db()
+    cur = conn.cursor()
 
-    if token in pending_users:
-        email = pending_users.pop(token)
-        return "✅ Email Verified. You can close this page."
-    else:
-        return "❌ Invalid or expired link"
+    cur.execute("""
+        SELECT code, created_at FROM users WHERE email=?
+    """, (email,))
+    row = cur.fetchone()
 
+    if not row:
+        conn.close()
+        return jsonify({"verified": False, "reason": "not_found"})
 
+    saved_code, created_at = row
+    current_time = int(time.time())
+
+    # ⏰ 20 minutes expiry
+    if current_time - created_at > OTP_EXPIRY_SECONDS:
+        conn.close()
+        return jsonify({"verified": False, "reason": "expired"})
+
+    if saved_code == code:
+        cur.execute("""
+            UPDATE users SET verified=1 WHERE email=?
+        """, (email,))
+        conn.commit()
+        conn.close()
+        return jsonify({"verified": True})
+
+    conn.close()
+    return jsonify({"verified": False, "reason": "wrong_code"})
+
+# ================= CHECK VERIFIED (OPTIONAL) =================
+@app.route("/check", methods=["POST"])
+def check_user():
+    data = request.get_json()
+    email = data.get("email")
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT verified FROM users WHERE email=?", (email,))
+    row = cur.fetchone()
+    conn.close()
+
+    if row and row[0] == 1:
+        return jsonify({"verified": True})
+
+    return jsonify({"verified": False})
+
+# ================= RUN SERVER =================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=10000)
